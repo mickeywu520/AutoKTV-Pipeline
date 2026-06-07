@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+myvenv/
+*.egg
+
+# Spleeter 自動下載的預訓練模型（~78 MB）
+pretrained_models/
+
+# 輸出檔案（自動產生）
+output/
+temp/
+
+# 大型音訊/影片檔
+*.wav
+*.mp4
+*.m4a
+*.flac
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
