@@ -7,6 +7,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import quote
 
 import syncedlyrics
+from rapidfuzz import fuzz as _fuzz
 from zhconv import convert as s2t
 
 from config import SUBTITLES_DIR, ROOT_DIR, LANGUAGE
@@ -168,6 +169,10 @@ def _build_k_tags(text: str, total_cs: int) -> str:
     return "".join(parts)
 
 
+def _similarity(text_a: str, text_b: str) -> float:
+    return _fuzz.partial_ratio(text_a, text_b)
+
+
 def _jaccard(text_a: str, text_b: str) -> float:
     chars_a = set(re.sub(r'\s', '', text_a))
     chars_b = set(re.sub(r'\s', '', text_b))
@@ -259,55 +264,49 @@ def _correct_with_plain_text(
         re.MULTILINE,
     )
 
-    new_dialogues = []
-    used_text = set()
-    matched_segs = set()
     matches = list(dialogue_pattern.finditer(raw))
+    new_dialogues = []
+    current_pos = 0
 
-    for seg_idx, m in enumerate(matches):
+    for m in matches:
         prefix = m.group(1)
         w_start = _ass_time_to_sec(m.group(2))
         w_end = _ass_time_to_sec(m.group(3))
         orig_text = m.group(4)
 
         if _is_gibberish(orig_text):
+            new_dialogues.append(m.group(0))
             continue
 
         w_clean = re.sub(r"\{\\k\d+\}", "", orig_text).replace("{}", "").strip()
         if not w_clean:
-            matched_segs.add(seg_idx)
             new_dialogues.append(m.group(0))
             continue
 
-        # 找最佳配對的純文字行（只看 Jaccard）
+        # 順序匹配：從 current_pos 往後搜最多 8 行
         best_idx = None
         best_score = 0
-        for i, text_line in enumerate(lines_text):
-            if i in used_text:
-                continue
-            score = _jaccard(w_clean, text_line)
+        for i in range(current_pos, min(len(lines_text), current_pos + 8)):
+            score = _similarity(w_clean, lines_text[i])
             if score > best_score:
                 best_score = score
                 best_idx = i
 
-        if best_idx is None or best_score < 0.15:
-            matched_segs.add(seg_idx)
+        if best_idx is None or best_score < 45:
             new_dialogues.append(m.group(0))
             continue
 
-        used_text.add(best_idx)
+        current_pos = best_idx + 1
         corrected = s2t(lines_text[best_idx], "zh-tw") if LANGUAGE == "zh" else lines_text[best_idx]
 
-        orig_k_durations = re.findall(r"\\k(\d+)", orig_text)
-        if not orig_k_durations:
-            matched_segs.add(seg_idx)
+        # 保留 Whisper 原始 \k 時長
+        k_vals = [int(d) for d in re.findall(r"\\k(\d+)", orig_text)]
+        if not k_vals:
             new_dialogues.append(m.group(0))
             continue
 
-        k_vals = [int(d) for d in orig_k_durations]
         chars = list(corrected.replace(" ", ""))
         if not chars:
-            matched_segs.add(seg_idx)
             new_dialogues.append(m.group(0))
             continue
 
@@ -325,15 +324,7 @@ def _correct_with_plain_text(
                 new_parts.append(f"{{\\k{extra_cs}}}{ch}")
         new_text = "".join(new_parts)
 
-        matched_segs.add(seg_idx)
         new_dialogues.append(f"{prefix}{new_text}")
-
-    # 補上因 gibberish 被跳過的 segment（保持原始輸出）
-    for seg_idx, m in enumerate(matches):
-        if seg_idx not in matched_segs:
-            new_dialogues.append(m.group(0))
-
-    new_dialogues.sort(key=lambda d: _ass_time_to_sec(d.split(",")[1]))
 
     ass_path.write_text(header + events_header + "\n".join(new_dialogues), encoding="utf-8")
     print(f"  純文字校正完成：{len(new_dialogues)} 行")

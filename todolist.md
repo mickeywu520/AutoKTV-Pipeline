@@ -33,6 +33,8 @@
 - [x] 跳過 LRC 元資料行 + 亂碼過濾 + 連續重複合併
 - [x] 保留 Whisper 原始 `\k` 比例（LRC + 純文字校正路徑），不走均分
 - [x] 純文字校正改為：for each Whisper segment → match plain text line（不 merge segment）
+- [x] 引入 RapidFuzz（`partial_ratio`）取代 Jaccard 做純文字配對
+- [x] 純文字校正改為 `current_pos` 順序匹配（避免副歌亂配）
 
 ---
 
