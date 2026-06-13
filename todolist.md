@@ -21,7 +21,7 @@
 - [x] 語音預處理（16kHz mono 轉換）提升時間軸準度
 - [x] `modules/lyrics_corrector.py` — LRC 網頁爬取 + 重疊匹配校正
 - [x] NetEase API 備用（syncedlyrics 失敗時自動切換）
-- [x] 合併 Whisper 重複片段 + `\k` 等比縮放（解決「一瞬間變灰色」）
+- [x] Used LRC 防重複配對（解決「一瞬間變灰色」）
 - [x] Whisper 原始輸出自動備份（`_whisper_raw.ass`）
 - [x] 多語支援：`config.LANGUAGE` 控制（zh/en/None），非 zh 跳過簡轉繁
 - [x] GPU 加速（Spleeter TensorFlow + faster-whisper CTranslate2）
@@ -31,6 +31,8 @@
 - [x] 分離器先轉 WAV 再餵 Spleeter（解決 FFmpeg backend `StopIteration`）
 - [x] LRC 無結果時，NetEase 網頁 API 備用搜尋
 - [x] 跳過 LRC 元資料行 + 亂碼過濾 + 連續重複合併
+- [x] 保留 Whisper 原始 `\k` 比例（LRC + 純文字校正路徑），不走均分
+- [x] 純文字校正改為：for each Whisper segment → match plain text line（不 merge segment）
 
 ---
 
