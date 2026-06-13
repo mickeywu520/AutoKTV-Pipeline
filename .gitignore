@@ -29,3 +29,9 @@ temp/
 # OS
 .DS_Store
 Thumbs.db
+
+# 測試/暫存用腳本（不上版）
+get_lyrcis*.py
+lrc_to_ass.py
+vtt_to_ass.py
+*.zip

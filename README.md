@@ -219,6 +219,7 @@ python main.py "<YouTube URL or keyword>" \
 
 ## REF:
 ```
+https://musely.ai/zh/tools/karaoke-subtitle-maker
 https://github.com/leeyoshinari/karaoke
 https://github.com/chidiwilliams/buzz
 https://github.com/ddmmbb-2/OpenKTV-AI/

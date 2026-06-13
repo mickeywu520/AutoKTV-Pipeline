@@ -14,12 +14,23 @@
 - [x] `modules/separator.py` — Spleeter 2stems 人聲/伴奏分離
 - [x] `modules/transcriber.py` — faster-whisper 轉寫 + 逐字 `\k` .ass 輸出
 
-### Stage 3：整合
-- [x] `main.py` — CLI 入口，三階段串聯（下載 → 分離 → 轉寫）
+### Stage 3：整合與校正
+- [x] `main.py` — CLI 入口，四階段串聯（下載 → 分離 → 轉寫 → 校正）
 - [x] ffmpeg 安裝（winget）
 - [x] 支援 CPU fallback（無 GPU 可跑）
 - [x] 語音預處理（16kHz mono 轉換）提升時間軸準度
-- [x] 驗證：`base` + `small` 模型皆可正常產出 .ass
+- [x] `modules/lyrics_corrector.py` — LRC 網頁爬取 + 重疊匹配校正
+- [x] NetEase API 備用（syncedlyrics 失敗時自動切換）
+- [x] 合併 Whisper 重複片段 + `\k` 等比縮放（解決「一瞬間變灰色」）
+- [x] Whisper 原始輸出自動備份（`_whisper_raw.ass`）
+- [x] 多語支援：`config.LANGUAGE` 控制（zh/en/None），非 zh 跳過簡轉繁
+- [x] GPU 加速（Spleeter TensorFlow + faster-whisper CTranslate2）
+
+### 其他修正
+- [x] 下載器排除非音訊檔（避免誤抓到 YouTube 自動字幕 .ass）
+- [x] 分離器先轉 WAV 再餵 Spleeter（解決 FFmpeg backend `StopIteration`）
+- [x] LRC 無結果時，NetEase 網頁 API 備用搜尋
+- [x] 跳過 LRC 元資料行 + 亂碼過濾 + 連續重複合併
 
 ---
 

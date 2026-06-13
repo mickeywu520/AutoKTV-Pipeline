@@ -18,7 +18,8 @@ except ImportError:
     DEVICE = "cpu"
 
 # ── Whisper 模型設定 ──
-MODEL_SIZE = "small"   # tiny / base / small / medium / large-v3
+MODEL_SIZE = "medium"   # tiny / base / small / medium / large-v3
+LANGUAGE = "zh"         # zh / en / None (None = 自動偵測)
 COMPUTE_TYPE = "float16" if DEVICE == "cuda" else "int8"
 
 # ── KTV 字幕風格 ──

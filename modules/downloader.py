@@ -12,6 +12,13 @@ def _resolve_input(query: str) -> str:
     return f"ytsearch1:{query}"
 
 
+_AUDIO_EXTENSIONS = {".m4a", ".mp3", ".wav", ".flac", ".opus", ".aac", ".ogg"}
+
+
+def _is_audio_file(path: Path) -> bool:
+    return path.suffix.lower() in _AUDIO_EXTENSIONS and path.stat().st_size > 0
+
+
 def download_audio(query: str) -> Path:
     url = _resolve_input(query)
 
@@ -21,6 +28,8 @@ def download_audio(query: str) -> Path:
         "quiet": True,
         "no_warnings": True,
         "extract_flat": False,
+        "writesubtitles": False,
+        "writeautomaticsub": False,
     }
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -28,13 +37,18 @@ def download_audio(query: str) -> Path:
 
     downloads = info.get("requested_downloads")
     if downloads:
-        return Path(downloads[0]["filepath"])
+        fp = Path(downloads[0]["filepath"])
+        if _is_audio_file(fp):
+            return fp
 
-    files = sorted(AUDIO_DIR.iterdir(), key=lambda f: f.stat().st_mtime, reverse=True)
+    files = sorted(
+        [f for f in AUDIO_DIR.iterdir() if _is_audio_file(f)],
+        key=lambda f: f.stat().st_mtime, reverse=True,
+    )
     if files:
         return files[0]
 
-    raise FileNotFoundError(f"Download completed but no file found for: {query}")
+    raise FileNotFoundError(f"Download completed but no audio file found for: {query}")
 
 
 def validate_audio(path: Path) -> bool:

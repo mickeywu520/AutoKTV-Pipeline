@@ -5,7 +5,7 @@ from pathlib import Path
 from faster_whisper import WhisperModel
 
 from config import (
-    MODEL_SIZE, DEVICE, COMPUTE_TYPE,
+    MODEL_SIZE, DEVICE, COMPUTE_TYPE, LANGUAGE,
     SUBTITLES_DIR, KTV_STYLE,
 )
 
@@ -68,7 +68,7 @@ def transcribe_to_ass(vocals_path: Path, output_name: str = None) -> Path:
         model = WhisperModel(MODEL_SIZE, device=DEVICE, compute_type=COMPUTE_TYPE)
         segments, info = model.transcribe(
             str(converted), word_timestamps=True,
-            language="zh",
+            language=LANGUAGE,
         )
 
         lines = []
