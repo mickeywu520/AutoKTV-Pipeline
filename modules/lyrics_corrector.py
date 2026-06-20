@@ -199,6 +199,23 @@ def normalize(text: str) -> str:
 # 3. 行級對齊
 # ---------------------------------------------------------------------------
 
+def _hybrid_score(a: str, b: str) -> float:
+    """
+    混合分數 = content 相似度 × 長度懲罰
+
+    content:
+      - partial_ratio（7 成）：在長字串中找短字串的最佳子視窗
+      - token_set_ratio（3 成）：不分順序比對共用字元集
+    長度懲罰： min(len1, len2) / max(len1, len2)
+    避免 2 字的 ASS 行靠子字串匹配到 20 字的歌詞行。
+    """
+    pr = fuzz.partial_ratio(a, b) / 100.0
+    ts = fuzz.token_set_ratio(a, b) / 100.0
+    content = 0.7 * pr + 0.3 * ts
+    len_ratio = min(len(a), len(b)) / max(len(a), len(b))
+    return content * len_ratio
+
+
 def align_ass_to_lyrics(
     dialogues    : list,
     lyric_lines  : list,
@@ -210,7 +227,7 @@ def align_ass_to_lyrics(
     策略：
       - 優先從上次位置往後 12 行（保持順序性）
       - 若信心不足，全局搜尋（支援副歌重複）
-      - 同時嘗試單行與連續兩行合併
+      - 每個位置同時嘗試單行與連續兩行合併
     """
     norm_lyrics = [normalize(l) for l in lyric_lines]
     result      = []
@@ -230,13 +247,12 @@ def align_ass_to_lyrics(
 
         def try_range(start, end):
             for li in range(start, min(end, len(norm_lyrics))):
-                # 單行
-                s1 = fuzz.ratio(norm_ass, norm_lyrics[li]) / 100.0
+                s1 = _hybrid_score(norm_ass, norm_lyrics[li])
                 if s1 > best['score']:
                     best.update({'score': s1, 'idx': li, 'text': lyric_lines[li]})
-                # 雙行合併
                 if li + 1 < len(norm_lyrics):
-                    s2 = fuzz.ratio(norm_ass, norm_lyrics[li] + norm_lyrics[li+1]) / 100.0
+                    merged = norm_lyrics[li] + norm_lyrics[li+1]
+                    s2 = _hybrid_score(norm_ass, merged)
                     if s2 > best['score']:
                         best.update({'score': s2, 'idx': li,
                                      'text': lyric_lines[li] + lyric_lines[li+1]})
