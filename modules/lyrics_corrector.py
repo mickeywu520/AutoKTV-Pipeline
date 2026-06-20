@@ -20,6 +20,7 @@ _METADATA_PREFIXES = (
     "未经", "未經", "词：", "曲：", "词 :", "曲 :", "OP：", "SP：",
     "原唱", "改编", "改編", "人声", "人聲", "音响", "音響", "乐队", "樂隊",
     "贝司", "貝司", "總監", "总监", "监制", "監製",
+    "詞曲", "曲詞", "詞：", "曲：",
 )
 
 _METADATA_ANYWHERE = (
@@ -170,7 +171,7 @@ def _build_k_tags(text: str, total_cs: int) -> str:
 
 
 def _similarity(text_a: str, text_b: str) -> float:
-    return _fuzz.partial_ratio(text_a, text_b)
+    return _fuzz.token_sort_ratio(text_a, text_b)
 
 
 def _jaccard(text_a: str, text_b: str) -> float:
@@ -232,6 +233,19 @@ def _validate_lrc(
     return median >= threshold
 
 
+def _seconds_to_lrc(sec: float) -> str:
+    m = int(sec // 60)
+    s = sec % 60
+    return f"{m:02d}:{s:05.2f}"
+
+
+def _save_raw_lyrics(text: str, suffix: str):
+    path = ROOT_DIR / "output" / "subtitles" / f"lyrics_fetched{suffix}"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+    print(f"  原始歌詞已儲存：{path}")
+
+
 def _fetch_plain_text() -> list[str] | None:
     """從 project_root/lyrics_plain.txt 讀取無時間軸歌詞。"""
     path = ROOT_DIR / "lyrics_plain.txt"
@@ -267,23 +281,23 @@ def _correct_with_plain_text(
     matches = list(dialogue_pattern.finditer(raw))
     new_dialogues = []
     current_pos = 0
+    seg_idx = 0
 
-    for m in matches:
-        prefix = m.group(1)
-        w_start = _ass_time_to_sec(m.group(2))
-        w_end = _ass_time_to_sec(m.group(3))
+    while seg_idx < len(matches):
+        m = matches[seg_idx]
         orig_text = m.group(4)
 
         if _is_gibberish(orig_text):
             new_dialogues.append(m.group(0))
+            seg_idx += 1
             continue
 
         w_clean = re.sub(r"\{\\k\d+\}", "", orig_text).replace("{}", "").strip()
-        if not w_clean:
-            new_dialogues.append(m.group(0))
+        if not w_clean or not _is_lyric_line(w_clean):
+            seg_idx += 1
             continue
 
-        # 順序匹配：從 current_pos 往後搜最多 8 行
+        # 找最佳匹配的 plain text line
         best_idx = None
         best_score = 0
         for i in range(current_pos, min(len(lines_text), current_pos + 8)):
@@ -292,39 +306,162 @@ def _correct_with_plain_text(
                 best_score = score
                 best_idx = i
 
-        if best_idx is None or best_score < 45:
-            new_dialogues.append(m.group(0))
+        if best_idx is None or best_score < 50:
+            # 無匹配 → 嘗試用 chunk 合併看能否拼成一行
+            if current_pos < len(lines_text):
+                target = lines_text[current_pos]
+                merged_buf = [seg_idx]
+                prev_end = _ass_time_to_sec(m.group(3))
+                matched = False
+                for nxt in range(seg_idx + 1, min(seg_idx + 4, len(matches))):
+                    nxt_start = _ass_time_to_sec(matches[nxt].group(2))
+                    if nxt_start - prev_end > 5.0:
+                        break
+                    t = re.sub(r"\{\\k\d+\}", "", matches[nxt].group(4)).replace("{}", "").strip()
+                    if not t or _is_gibberish(matches[nxt].group(4)) or not _is_lyric_line(t):
+                        break
+                    merged_buf.append(nxt)
+                    merged_parts = []
+                    for j in merged_buf:
+                        tj = re.sub(r"\{\\k\d+\}", "", matches[j].group(4)).replace("{}", "").strip()
+                        if tj:
+                            merged_parts.append(tj)
+                    m_clean = " ".join(merged_parts)
+                    m_score = _similarity(m_clean, target)
+                    w_chunks = len([c for c in m_clean.split() if c])
+                    t_chunks = len([c for c in target.split() if c])
+                    prev_end = _ass_time_to_sec(matches[nxt].group(3))
+                    if m_score >= 60 and w_chunks >= t_chunks:
+                        # 合併成功
+                        corrected = s2t(target, "zh-tw") if LANGUAGE == "zh" else target
+                        all_k = []
+                        w_start = _ass_time_to_sec(matches[merged_buf[0]].group(2))
+                        w_end = _ass_time_to_sec(matches[merged_buf[-1]].group(3))
+                        for j in merged_buf:
+                            all_k.extend(int(d) for d in re.findall(r"\\k(\d+)", matches[j].group(4)))
+                        k_vals = all_k
+                        if k_vals:
+                            chars = list(corrected.replace(" ", ""))
+                            if chars:
+                                prefix = f"Dialogue: 0,{_seconds_to_ass(w_start)},{_seconds_to_ass(w_end)},Karaoke,,0,0,0,,"
+                                new_parts = []
+                                if len(chars) >= len(k_vals):
+                                    for i in range(len(k_vals)):
+                                        new_parts.append(f"{{\\k{k_vals[i]}}}{chars[i]}")
+                                    remaining = chars[len(k_vals):]
+                                    if remaining:
+                                        new_parts.append("".join(remaining))
+                                else:
+                                    total_cs = max(1, int(round((w_end - w_start) * 100)))
+                                    extra_cs = max(1, total_cs // len(chars))
+                                    for ch in chars:
+                                        new_parts.append(f"{{\\k{extra_cs}}}{ch}")
+                                new_text = "".join(new_parts)
+                                new_dialogues.append(f"{prefix}{new_text}")
+                                seg_idx += len(merged_buf)
+                                current_pos += 1
+                                matched = True
+                                break
+                if not matched:
+                    new_dialogues.append(m.group(0))
+                    seg_idx += 1
+            else:
+                new_dialogues.append(m.group(0))
+                seg_idx += 1
             continue
 
-        current_pos = best_idx + 1
-        corrected = s2t(lines_text[best_idx], "zh-tw") if LANGUAGE == "zh" else lines_text[best_idx]
+        # 有匹配行：依 chunk 數決定是否合併
+        target_line = lines_text[best_idx]
+        w_chunks = len([c for c in w_clean.split() if c])
+        t_chunks = len([c for c in target_line.split() if c])
 
-        # 保留 Whisper 原始 \k 時長
-        k_vals = [int(d) for d in re.findall(r"\\k(\d+)", orig_text)]
-        if not k_vals:
-            new_dialogues.append(m.group(0))
-            continue
-
-        chars = list(corrected.replace(" ", ""))
-        if not chars:
-            new_dialogues.append(m.group(0))
-            continue
-
-        new_parts = []
-        if len(chars) >= len(k_vals):
-            for i in range(len(k_vals)):
-                new_parts.append(f"{{\\k{k_vals[i]}}}{chars[i]}")
-            remaining = chars[len(k_vals):]
-            if remaining:
-                new_parts.append("".join(remaining))
+        if w_chunks >= t_chunks:
+            # 1:1 匹配
+            corrected = s2t(target_line, "zh-tw") if LANGUAGE == "zh" else target_line
+            k_vals = [int(d) for d in re.findall(r"\\k(\d+)", orig_text)]
+            if not k_vals:
+                new_dialogues.append(m.group(0))
+                seg_idx += 1
+                continue
+            chars = list(corrected.replace(" ", ""))
+            if not chars:
+                new_dialogues.append(m.group(0))
+                seg_idx += 1
+                continue
+            w_end = _ass_time_to_sec(m.group(3))
+            w_start = _ass_time_to_sec(m.group(2))
+            new_parts = []
+            if len(chars) >= len(k_vals):
+                for i in range(len(k_vals)):
+                    new_parts.append(f"{{\\k{k_vals[i]}}}{chars[i]}")
+                remaining = chars[len(k_vals):]
+                if remaining:
+                    new_parts.append("".join(remaining))
+            else:
+                total_cs = max(1, int(round((w_end - w_start) * 100)))
+                extra_cs = max(1, total_cs // len(chars))
+                for ch in chars:
+                    new_parts.append(f"{{\\k{extra_cs}}}{ch}")
+            new_text = "".join(new_parts)
+            new_dialogues.append(f"{m.group(1)}{new_text}")
+            current_pos = best_idx + 1
+            seg_idx += 1
         else:
-            total_cs = max(1, int(round((w_end - w_start) * 100)))
-            extra_cs = max(1, total_cs // len(chars))
-            for ch in chars:
-                new_parts.append(f"{{\\k{extra_cs}}}{ch}")
-        new_text = "".join(new_parts)
-
-        new_dialogues.append(f"{prefix}{new_text}")
+            # 行中斷 → 往後合併，需同時滿足：時間連續 + 相似度達標 + chunk 數足夠
+            merged_buf = [seg_idx]
+            matched = False
+            prev_end = _ass_time_to_sec(m.group(3))
+            for nxt in range(seg_idx + 1, min(seg_idx + 4, len(matches))):
+                nxt_start = _ass_time_to_sec(matches[nxt].group(2))
+                if nxt_start - prev_end > 5.0:
+                    break  # 時間不連續，不該合併
+                t = re.sub(r"\{\\k\d+\}", "", matches[nxt].group(4)).replace("{}", "").strip()
+                if not t or _is_gibberish(matches[nxt].group(4)) or not _is_lyric_line(t):
+                    break
+                merged_buf.append(nxt)
+                m_parts = []
+                for j in merged_buf:
+                    tj = re.sub(r"\{\\k\d+\}", "", matches[j].group(4)).replace("{}", "").strip()
+                    if tj:
+                        m_parts.append(tj)
+                m_clean = " ".join(m_parts)
+                m_chunks = len([c for c in m_clean.split() if c])
+                m_score = _similarity(m_clean, target_line)
+                prev_end = _ass_time_to_sec(matches[nxt].group(3))
+                if m_chunks >= t_chunks and m_score >= 60:
+                    corrected = s2t(target_line, "zh-tw") if LANGUAGE == "zh" else target_line
+                    all_k = []
+                    w_start = _ass_time_to_sec(matches[merged_buf[0]].group(2))
+                    w_end = _ass_time_to_sec(matches[merged_buf[-1]].group(3))
+                    for j in merged_buf:
+                        all_k.extend(int(d) for d in re.findall(r"\\k(\d+)", matches[j].group(4)))
+                    k_vals = all_k
+                    if k_vals:
+                        chars = list(corrected.replace(" ", ""))
+                        if chars:
+                            new_prefix = f"Dialogue: 0,{_seconds_to_ass(w_start)},{_seconds_to_ass(w_end)},Karaoke,,0,0,0,,"
+                            new_parts = []
+                            if len(chars) >= len(k_vals):
+                                for i in range(len(k_vals)):
+                                    new_parts.append(f"{{\\k{k_vals[i]}}}{chars[i]}")
+                                remaining = chars[len(k_vals):]
+                                if remaining:
+                                    new_parts.append("".join(remaining))
+                            else:
+                                total_cs = max(1, int(round((w_end - w_start) * 100)))
+                                extra_cs = max(1, total_cs // len(chars))
+                                for ch in chars:
+                                    new_parts.append(f"{{\\k{extra_cs}}}{ch}")
+                            new_text = "".join(new_parts)
+                            new_dialogues.append(f"{new_prefix}{new_text}")
+                            seg_idx += len(merged_buf)
+                            current_pos = best_idx + 1
+                            matched = True
+                            break
+                prev_end = _ass_time_to_sec(matches[nxt].group(3))
+            if not matched:
+                new_dialogues.append(m.group(0))
+                seg_idx += 1
 
     ass_path.write_text(header + events_header + "\n".join(new_dialogues), encoding="utf-8")
     print(f"  純文字校正完成：{len(new_dialogues)} 行")
@@ -354,6 +491,7 @@ def correct_ass(ass_path: Path, query: str) -> Path:
     plain_lines = _fetch_plain_text()
     if plain_lines:
         print(f"  偵測到 lyrics_plain.txt，以手動歌詞為主（{len(plain_lines)} 行）")
+        _save_raw_lyrics("\n".join(plain_lines), ".txt")
         return _correct_with_plain_text(ass_path, plain_lines, whisper_segs)
 
     # ── 嘗試取得 LRC ──
@@ -364,6 +502,10 @@ def correct_ass(ass_path: Path, query: str) -> Path:
 
     # ── LRC 有效 → 走時間軸校正 ──
     if lrc_lines:
+        _save_raw_lyrics(
+            "\n".join(f"[{_seconds_to_lrc(t)}]{txt}" for t, _, txt in lrc_lines),
+            ".lrc",
+        )
         offset = _estimate_offset(whisper_segs, lrc_lines)
         print(f"  偵測到 Whisper vs LRC 時間偏移：{offset:+.2f} 秒")
 
@@ -379,11 +521,12 @@ def correct_ass(ass_path: Path, query: str) -> Path:
             "MarginL, MarginR, MarginV, Effect, Text\n"
         )
 
-        new_dialogues = []
-        used_lrc = set()
+        # Phase 1：每個 Whisper segment 找最近的 LRC 行（允許重複）
+        all_matches = list(dialogue_pattern.finditer(raw))
+        seg_groups = []  # [(lrc_idx, lrc_text, [(m, orig_text, w_start, w_end), ...])]
+        temp_group = None
 
-        for m in dialogue_pattern.finditer(raw):
-            prefix = m.group(1)
+        for m in all_matches:
             w_start = _ass_time_to_sec(m.group(2))
             w_end = _ass_time_to_sec(m.group(3))
             orig_text = m.group(4)
@@ -392,49 +535,100 @@ def correct_ass(ass_path: Path, query: str) -> Path:
                 continue
 
             lrc_time = w_start - offset
-
             best_idx = None
             best_dist = float("inf")
             for i, (l_start, l_end, l_text) in enumerate(lrc_lines):
                 dist = abs(lrc_time - l_start)
-                if dist < best_dist and dist <= 6.0 and i not in used_lrc:
+                if dist < best_dist and dist <= 6.0:
                     best_dist = dist
                     best_idx = i
 
             if best_idx is None:
-                new_dialogues.append(m.group(0))
+                seg_groups.append((None, None, [(m, orig_text, w_start, w_end)]))
                 continue
 
-            used_lrc.add(best_idx)
             _, _, lrc_text = lrc_lines[best_idx]
-            corrected = s2t(lrc_text, "zh-tw") if LANGUAGE == "zh" else lrc_text
-
-            orig_k_durations = re.findall(r"\\k(\d+)", orig_text)
-            if not orig_k_durations:
-                new_dialogues.append(m.group(0))
-                continue
-
-            k_vals = [int(d) for d in orig_k_durations]
-            chars = list(corrected.replace(" ", ""))
-            if not chars:
-                new_dialogues.append(m.group(0))
-                continue
-
-            new_parts = []
-            if len(chars) >= len(k_vals):
-                for i in range(len(k_vals)):
-                    new_parts.append(f"{{\\k{k_vals[i]}}}{chars[i]}")
-                remaining = chars[len(k_vals):]
-                if remaining:
-                    new_parts.append("".join(remaining))
+            if temp_group is not None and temp_group[0] == best_idx:
+                temp_group[2].append((m, orig_text, w_start, w_end))
             else:
-                total_cs = max(1, int(round((w_end - w_start) * 100)))
-                extra_cs = max(1, total_cs // len(chars))
-                for ch in chars:
-                    new_parts.append(f"{{\\k{extra_cs}}}{ch}")
-            new_text = "".join(new_parts)
+                if temp_group is not None:
+                    seg_groups.append(temp_group)
+                temp_group = (best_idx, lrc_text, [(m, orig_text, w_start, w_end)])
 
-            new_dialogues.append(f"{prefix}{new_text}")
+        if temp_group is not None:
+            seg_groups.append(temp_group)
+
+        # Phase 2：逐組處理，若同 LRC 連續多個 segment 則拆分文字
+        new_dialogues = []
+        for lrc_idx, lrc_text, segs in seg_groups:
+            if lrc_idx is None or len(segs) == 1:
+                # 無匹配或只有 1 個 → 直接套用原邏輯
+                for m, orig_text, w_start, w_end in segs:
+                    if lrc_idx is None:
+                        new_dialogues.append(m.group(0))
+                        continue
+                    corrected = s2t(lrc_text, "zh-tw") if LANGUAGE == "zh" else lrc_text
+                    prefix = m.group(1)
+                    k_vals = [int(d) for d in re.findall(r"\\k(\d+)", orig_text)]
+                    if not k_vals:
+                        new_dialogues.append(m.group(0))
+                        continue
+                    chars = list(corrected.replace(" ", ""))
+                    if not chars:
+                        new_dialogues.append(m.group(0))
+                        continue
+                    new_parts = []
+                    if len(chars) >= len(k_vals):
+                        for i in range(len(k_vals)):
+                            new_parts.append(f"{{\\k{k_vals[i]}}}{chars[i]}")
+                        remaining = chars[len(k_vals):]
+                        if remaining:
+                            new_parts.append("".join(remaining))
+                    else:
+                        total_cs = max(1, int(round((w_end - w_start) * 100)))
+                        extra_cs = max(1, total_cs // len(chars))
+                        for ch in chars:
+                            new_parts.append(f"{{\\k{extra_cs}}}{ch}")
+                    new_dialogues.append(f"{prefix}{''.join(new_parts)}")
+            else:
+                # 多個連續 segment 共用同一 LRC 行 → 按時長比例拆分文字
+                is_zh = LANGUAGE == "zh"
+                full_text = s2t(lrc_text, "zh-tw") if is_zh else lrc_text
+                total_dur = sum(we - ws for _, _, ws, we in segs)
+                char_pos = 0
+                all_chars = list(full_text.replace(" ", ""))
+                for idx_in_group, (m, orig_text, w_start, w_end) in enumerate(segs):
+                    prefix = m.group(1)
+                    seg_dur = w_end - w_start
+                    if idx_in_group == len(segs) - 1:
+                        seg_chars = all_chars[char_pos:]
+                    else:
+                        ratio = seg_dur / total_dur if total_dur > 0 else 1.0 / len(segs)
+                        n_chars = max(1, int(round(len(all_chars) * ratio)))
+                        remaining = len(all_chars) - char_pos - n_chars
+                        n_others = len(segs) - idx_in_group - 1
+                        if remaining < n_others:
+                            n_chars = len(all_chars) - char_pos - n_others
+                        seg_chars = all_chars[char_pos:char_pos + n_chars]
+                        char_pos += n_chars
+
+                    k_vals = [int(d) for d in re.findall(r"\\k(\d+)", orig_text)]
+                    if not k_vals:
+                        new_dialogues.append(m.group(0))
+                        continue
+                    new_parts = []
+                    if len(seg_chars) >= len(k_vals):
+                        for i in range(len(k_vals)):
+                            new_parts.append(f"{{\\k{k_vals[i]}}}{seg_chars[i]}")
+                        r = seg_chars[len(k_vals):]
+                        if r:
+                            new_parts.append("".join(r))
+                    else:
+                        total_cs = max(1, int(round(seg_dur * 100)))
+                        extra_cs = max(1, total_cs // len(seg_chars))
+                        for ch in seg_chars:
+                            new_parts.append(f"{{\\k{extra_cs}}}{ch}")
+                    new_dialogues.append(f"{prefix}{''.join(new_parts)}")
 
         ass_path.write_text(
             header + events_header + "\n".join(new_dialogues),
