@@ -521,114 +521,120 @@ def correct_ass(ass_path: Path, query: str) -> Path:
             "MarginL, MarginR, MarginV, Effect, Text\n"
         )
 
-        # Phase 1：每個 Whisper segment 找最近的 LRC 行（允許重複）
-        all_matches = list(dialogue_pattern.finditer(raw))
-        seg_groups = []  # [(lrc_idx, lrc_text, [(m, orig_text, w_start, w_end), ...])]
-        temp_group = None
-
-        for m in all_matches:
-            w_start = _ass_time_to_sec(m.group(2))
-            w_end = _ass_time_to_sec(m.group(3))
-            orig_text = m.group(4)
-
-            if _is_gibberish(orig_text):
-                continue
-
-            lrc_time = w_start - offset
-            best_idx = None
-            best_dist = float("inf")
-            for i, (l_start, l_end, l_text) in enumerate(lrc_lines):
-                dist = abs(lrc_time - l_start)
-                if dist < best_dist and dist <= 6.0:
-                    best_dist = dist
-                    best_idx = i
-
-            if best_idx is None:
-                seg_groups.append((None, None, [(m, orig_text, w_start, w_end)]))
-                continue
-
-            _, _, lrc_text = lrc_lines[best_idx]
-            if temp_group is not None and temp_group[0] == best_idx:
-                temp_group[2].append((m, orig_text, w_start, w_end))
-            else:
-                if temp_group is not None:
-                    seg_groups.append(temp_group)
-                temp_group = (best_idx, lrc_text, [(m, orig_text, w_start, w_end)])
-
-        if temp_group is not None:
-            seg_groups.append(temp_group)
-
-        # Phase 2：逐組處理，若同 LRC 連續多個 segment 則拆分文字
+        # ── 兩階段處理 ──
+        # Phase 1：遍歷所有 segment，將連續相同 LRC index 的歸為一組
+        # Phase 2：逐組 output，同組多段時依原始 Whisper 字數比例拆分 LRC
         new_dialogues = []
-        for lrc_idx, lrc_text, segs in seg_groups:
-            if lrc_idx is None or len(segs) == 1:
-                # 無匹配或只有 1 個 → 直接套用原邏輯
-                for m, orig_text, w_start, w_end in segs:
-                    if lrc_idx is None:
-                        new_dialogues.append(m.group(0))
-                        continue
-                    corrected = s2t(lrc_text, "zh-tw") if LANGUAGE == "zh" else lrc_text
-                    prefix = m.group(1)
-                    k_vals = [int(d) for d in re.findall(r"\\k(\d+)", orig_text)]
-                    if not k_vals:
-                        new_dialogues.append(m.group(0))
-                        continue
-                    chars = list(corrected.replace(" ", ""))
-                    if not chars:
-                        new_dialogues.append(m.group(0))
-                        continue
-                    new_parts = []
-                    if len(chars) >= len(k_vals):
-                        for i in range(len(k_vals)):
-                            new_parts.append(f"{{\\k{k_vals[i]}}}{chars[i]}")
-                        remaining = chars[len(k_vals):]
-                        if remaining:
-                            new_parts.append("".join(remaining))
-                    else:
-                        total_cs = max(1, int(round((w_end - w_start) * 100)))
-                        extra_cs = max(1, total_cs // len(chars))
-                        for ch in chars:
-                            new_parts.append(f"{{\\k{extra_cs}}}{ch}")
-                    new_dialogues.append(f"{prefix}{''.join(new_parts)}")
-            else:
-                # 多個連續 segment 共用同一 LRC 行 → 按時長比例拆分文字
-                is_zh = LANGUAGE == "zh"
-                full_text = s2t(lrc_text, "zh-tw") if is_zh else lrc_text
-                total_dur = sum(we - ws for _, _, ws, we in segs)
-                char_pos = 0
-                all_chars = list(full_text.replace(" ", ""))
-                for idx_in_group, (m, orig_text, w_start, w_end) in enumerate(segs):
-                    prefix = m.group(1)
-                    seg_dur = w_end - w_start
-                    if idx_in_group == len(segs) - 1:
-                        seg_chars = all_chars[char_pos:]
-                    else:
-                        ratio = seg_dur / total_dur if total_dur > 0 else 1.0 / len(segs)
-                        n_chars = max(1, int(round(len(all_chars) * ratio)))
-                        remaining = len(all_chars) - char_pos - n_chars
-                        n_others = len(segs) - idx_in_group - 1
-                        if remaining < n_others:
-                            n_chars = len(all_chars) - char_pos - n_others
-                        seg_chars = all_chars[char_pos:char_pos + n_chars]
-                        char_pos += n_chars
+        cur_group = None  # (lrc_idx, lrc_text, [(m, orig_text, w_start, w_end), ...])
 
-                    k_vals = [int(d) for d in re.findall(r"\\k(\d+)", orig_text)]
-                    if not k_vals:
+        def _finalize_group():
+            nonlocal cur_group
+            if cur_group is None:
+                return
+            gi, gt, segs = cur_group
+            if gi is None:
+                for m, ot, _, _ in segs:
+                    new_dialogues.append(m.group(0))
+            elif len(segs) == 1:
+                m, ot, ws, we = segs[0]
+                corrected = s2t(gt, "zh-tw") if LANGUAGE == "zh" else gt
+                prefix = m.group(1)
+                kv = [int(d) for d in re.findall(r"\\k(\d+)", ot)]
+                if kv:
+                    chars = list(corrected.replace(" ", ""))
+                    if chars:
+                        np = []
+                        if len(chars) >= len(kv):
+                            for i in range(len(kv)):
+                                np.append(f"{{\\k{kv[i]}}}{chars[i]}")
+                            r = chars[len(kv):]
+                            if r:
+                                np.append("".join(r))
+                        else:
+                            tc = max(1, int(round((we - ws) * 100)))
+                            ec = max(1, tc // len(chars))
+                            for ch in chars:
+                                np.append(f"{{\\k{ec}}}{ch}")
+                        new_dialogues.append(f"{prefix}{''.join(np)}")
+                    else:
+                        new_dialogues.append(m.group(0))
+                else:
+                    new_dialogues.append(m.group(0))
+            else:
+                # 多段共用同一 LRC → 依原始 Whisper 各段非空白字數比例拆分
+                full_text = s2t(gt, "zh-tw") if LANGUAGE == "zh" else gt
+                all_chars = list(full_text.replace(" ", ""))
+                orig_lens = [len(re.sub(r"\{\\k\d+\}", "", ot).replace("{}", "").replace(" ", ""))
+                             for _, ot, _, _ in segs]
+                total_orig = sum(orig_lens) or 1
+                cp = 0
+                for ig, (m, ot, ws, we) in enumerate(segs):
+                    prefix = m.group(1)
+                    if ig == len(segs) - 1:
+                        seg_chars = all_chars[cp:]
+                    else:
+                        nc = max(1, int(round(len(all_chars) * orig_lens[ig] / total_orig)))
+                        rem = len(all_chars) - cp - nc
+                        no = len(segs) - ig - 1
+                        if rem < no:
+                            nc = len(all_chars) - cp - no
+                        seg_chars = all_chars[cp:cp + nc]
+                        cp += nc
+                    kv = [int(d) for d in re.findall(r"\\k(\d+)", ot)]
+                    if not kv:
                         new_dialogues.append(m.group(0))
                         continue
-                    new_parts = []
-                    if len(seg_chars) >= len(k_vals):
-                        for i in range(len(k_vals)):
-                            new_parts.append(f"{{\\k{k_vals[i]}}}{seg_chars[i]}")
-                        r = seg_chars[len(k_vals):]
+                    np = []
+                    if len(seg_chars) >= len(kv):
+                        for i in range(len(kv)):
+                            np.append(f"{{\\k{kv[i]}}}{seg_chars[i]}")
+                        r = seg_chars[len(kv):]
                         if r:
-                            new_parts.append("".join(r))
+                            np.append("".join(r))
                     else:
-                        total_cs = max(1, int(round(seg_dur * 100)))
-                        extra_cs = max(1, total_cs // len(seg_chars))
+                        tc = max(1, int(round((we - ws) * 100)))
+                        ec = max(1, tc // len(seg_chars))
                         for ch in seg_chars:
-                            new_parts.append(f"{{\\k{extra_cs}}}{ch}")
-                    new_dialogues.append(f"{prefix}{''.join(new_parts)}")
+                            np.append(f"{{\\k{ec}}}{ch}")
+                    new_dialogues.append(f"{prefix}{''.join(np)}")
+            cur_group = None
+
+        for m in dialogue_pattern.finditer(raw):
+            ws = _ass_time_to_sec(m.group(2))
+            we = _ass_time_to_sec(m.group(3))
+            ot = m.group(4)
+
+            if _is_gibberish(ot):
+                continue
+
+            lrc_time = ws - offset
+            bi = None
+            bd = float("inf")
+            for i, (ls, _, lt) in enumerate(lrc_lines):
+                d = abs(lrc_time - ls)
+                if d < bd and d <= 6.0:
+                    bd = d
+                    bi = i
+
+            # 與前組 LRC index 不同 → finalize 前組
+            if cur_group is not None and cur_group[0] != bi:
+                _finalize_group()
+
+            if bi is None:
+                # 此段無匹配 → 獨立成組（後續可能合併？但無 LRC 可合）
+                if cur_group is None:
+                    cur_group = (None, None, [(m, ot, ws, we)])
+                else:
+                    cur_group[2].append((m, ot, ws, we))
+            else:
+                _, _, lt = lrc_lines[bi]
+                if cur_group is None:
+                    cur_group = (bi, lt, [(m, ot, ws, we)])
+                else:
+                    # 與前組同 index → 延續
+                    cur_group[2].append((m, ot, ws, we))
+
+        _finalize_group()
 
         ass_path.write_text(
             header + events_header + "\n".join(new_dialogues),
