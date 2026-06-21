@@ -167,32 +167,58 @@ def slots_to_ass_text(slots, remainder='') -> str:
 
 def load_lyrics(path: str) -> list:
     """
-    載入歌詞，並自動把「空格分隔的兩句」拆成兩行。
-    歌詞網常見格式：「像泡沫懸浮著 在風裡小心穿梭」→ 拆成兩行。
-    拆分條件：全形空格或半形空格出現在字元之間，
-             且空格兩側都有中文字元（避免歌手名稱誤拆）。
+    載入歌詞檔案，每行即一個歌詞片段，原樣保留（含句內空格）。
+    不做自動拆行——手動整理的歌詞每行已是正確粒度。
+    網路歌詞的拆行由 _split_lyric_lines() 在另一路徑處理。
     """
-    import re as _re
     with open(path, encoding='utf-8') as f:
         raw_lines = [l.strip() for l in f.readlines()]
-    result = []
-    for line in raw_lines:
-        if not line:
-            continue
-        # 在 CJK字元 + 空格 + CJK字元 處拆行
-        parts = _re.split(r'(?<=[\u4e00-\u9fff\u3040-\u30ff])[ \u3000]+(?=[\u4e00-\u9fff\u3040-\u30ff])', line)
-        for p in parts:
-            p = p.strip()
-            if p:
-                result.append(p)
-    return result
-
+    return [l for l in raw_lines if l]
 
 def normalize(text: str) -> str:
     """正規化用於相似度比對：全形→半形、去標點空格"""
     text = unicodedata.normalize('NFKC', text)
     text = re.sub(r'[\s　，。！？、：；「」『』【】〔〕…—～·\-_]', '', text)
     return text
+
+
+# ---------------------------------------------------------------------------
+# 3-0. 非歌詞行過濾
+# ---------------------------------------------------------------------------
+
+_SIMPLIFIED_CHARS = set('请订转赏爱们说话这样来过还没对让')
+
+def _cjk_ratio(text: str) -> float:
+    if not text: return 0.0
+    return sum(1 for c in text if '\u4e00' <= c <= '\u9fff') / len(text)
+
+def _simplified_ratio(text: str) -> float:
+    cjk = [c for c in text if '\u4e00' <= c <= '\u9fff']
+    if not cjk: return 0.0
+    return sum(1 for c in cjk if c in _SIMPLIFIED_CHARS) / len(cjk)
+
+_GARBAGE_KEYWORDS = [
+    '詞曲', '作詞', '作曲', '編曲', '製作', '出版', '發行',
+    '版權', 'copyright', '©', '℗',
+    '訂閱', '点赞', '转发', '打赏', '明镜', '点点栏目', 'subscribe',
+]
+
+def _is_garbage_line(text: str) -> bool:
+    norm = normalize(text)
+    if len(norm) <= 1:
+        return True
+    low = text.lower()
+    for kw in _GARBAGE_KEYWORDS:
+        if kw.lower() in low:
+            return True
+    if re.search(r'https?://|www\\.|@', text):
+        return True
+    if _simplified_ratio(text) > 0.30:
+        return True
+    if len(norm) > 5 and _cjk_ratio(text) < 0.50:
+        return True
+    return False
+
 
 
 # ---------------------------------------------------------------------------
@@ -224,43 +250,85 @@ def align_ass_to_lyrics(
 ) -> list:
     """
     對每個 Dialogue 行找最佳對齊歌詞。
-    策略：
-      - 優先從上次位置往後 12 行（保持順序性）
-      - 若信心不足，全局搜尋（支援副歌重複）
-      - 每個位置同時嘗試單行與連續兩行合併
-    """
-    norm_lyrics = [normalize(l) for l in lyric_lines]
-    result      = []
-    lyric_ptr   = 0
 
-    for dia in dialogues:
+    策略：
+      A. 比例錨點（Proportional Anchor）
+         依 ASS 行索引在歌詞中推算「期望位置」，搜尋視窗以此為中心。
+         解決 ASS 行數 ≠ 歌詞行數導致後段偏移的問題。
+
+      B. 局部搜尋 → 若信心不足 → 全局搜尋（支援副歌重複）
+
+      C. 每個位置同時嘗試：
+         - 單行
+         - 連續兩行合併（Whisper 有時把兩句壓成一行）
+         - 歌詞行的後半段（歌詞一行 Whisper 拆兩行的情況）
+    """
+    norm_lyrics   = [normalize(l) for l in lyric_lines]
+    n_lyric       = len(norm_lyrics)
+    result        = []
+    lyric_ptr     = 0
+
+    # 比例錨點：只計算非垃圾行
+    valid_indices = [i for i, d in enumerate(dialogues)
+                     if not _is_garbage_line(slots_to_text(d['slots']))]
+    n_valid    = max(len(valid_indices), 1)
+    valid_rank = {idx: rank for rank, idx in enumerate(valid_indices)}
+
+    for ass_idx, dia in enumerate(dialogues):
         ass_text = slots_to_text(dia['slots'])
         norm_ass = normalize(ass_text)
 
-        if not norm_ass:
+        # 垃圾行（廣告/版權/空行）：跳過校正，原文保留
+        if not norm_ass or _is_garbage_line(ass_text):
             d = deepcopy(dia)
-            d.update({'lyric_match': ass_text, 'confidence': 1.0, 'needs_review': False})
+            d.update({'lyric_match': ass_text, 'confidence': 1.0,
+                      'needs_review': False, 'was_garbage': True})
             result.append(d)
+            if verbose and ass_text.strip():
+                print(f'  [SKIP] {ass_text!r:35s}  （非歌詞行）')
             continue
 
-        best = {'score': -1, 'idx': lyric_ptr, 'text': ''}
+        # 比例錨點：依非垃圾行排名算期望位置
+        rank        = valid_rank.get(ass_idx, n_valid // 2)
+        ratio       = rank / max(n_valid - 1, 1)
+        anchor      = int(ratio * (n_lyric - 1))
+        anchor      = max(anchor, lyric_ptr)
+        window_half = max(6, n_lyric // 6)
+
+        best = {'score': -1, 'idx': anchor, 'text': ''}
 
         def try_range(start, end):
-            for li in range(start, min(end, len(norm_lyrics))):
+            for li in range(max(0, start), min(end, n_lyric)):
+                # 單行
                 s1 = _hybrid_score(norm_ass, norm_lyrics[li])
                 if s1 > best['score']:
                     best.update({'score': s1, 'idx': li, 'text': lyric_lines[li]})
-                if li + 1 < len(norm_lyrics):
-                    merged = norm_lyrics[li] + norm_lyrics[li+1]
+
+                # 雙行合併（Whisper 斷句較細時）
+                if li + 1 < n_lyric:
+                    merged = norm_lyrics[li] + norm_lyrics[li + 1]
                     s2 = _hybrid_score(norm_ass, merged)
                     if s2 > best['score']:
                         best.update({'score': s2, 'idx': li,
-                                     'text': lyric_lines[li] + lyric_lines[li+1]})
+                                     'text': lyric_lines[li] + lyric_lines[li + 1]})
 
-        try_range(lyric_ptr, lyric_ptr + 12)
+                # 後半段切片（歌詞一行 Whisper 拆成兩行時）
+                half = len(norm_lyrics[li]) // 2
+                if half >= 2:
+                    back_half = norm_lyrics[li][half:]
+                    s3 = _hybrid_score(norm_ass, back_half)
+                    if s3 > best['score']:
+                        best.update({'score': s3, 'idx': li,
+                                     'text': lyric_lines[li][half:]})
+
+        # 第一優先：以錨點為中心的視窗
+        try_range(anchor - window_half, anchor + window_half + 1)
+
+        # 信心不足 → 全局搜尋（副歌重複）
         if best['score'] < sim_threshold:
-            try_range(0, len(norm_lyrics))  # 全局搜尋（副歌重複）
+            try_range(lyric_ptr, n_lyric)
 
+        # 更新下限指標（只前進不後退）
         if best['score'] >= sim_threshold:
             lyric_ptr = best['idx'] + 1
 
@@ -268,7 +336,7 @@ def align_ass_to_lyrics(
 
         if verbose:
             tag = '[?]' if needs_review else '   '
-            print(f"{tag} [{best['score']:.2f}]  ASS: {ass_text!r:22s}  →  LYRIC: {best['text']!r}")
+            print(f"{tag} [{best['score']:.2f}]  ASS: {ass_text!r:30s}  →  LYRIC: {best['text']!r}")
 
         d = deepcopy(dia)
         d.update({
@@ -285,12 +353,72 @@ def align_ass_to_lyrics(
 # 4. 字元填充
 # ---------------------------------------------------------------------------
 
+def _lcs_align(orig_chars: list, correct_chars: list) -> list:
+    """
+    用 LCS（最長公共子序列）把 orig_chars 的時間對應到 correct_chars。
+
+    參數：
+        orig_chars    : list of (duration_cs: int, char: str)
+        correct_chars : list of str
+
+    回傳 list of (duration_cs, char)，長度 = len(correct_chars)。
+
+    演算法：
+      1. SequenceMatcher 找出兩個字串的 matching blocks（公共子序列）
+      2. 公共字元直接繼承 orig 的時間
+      3. 非公共的 correct 字元（新增字）：
+         均分「orig 中未被命中的時間」給這些字元
+      4. 若 correct 比 orig 長，額外字元各得 1cs（最小合法值）
+    """
+    import difflib
+
+    orig_text    = ''.join(ch for _, ch in orig_chars)
+    correct_text = ''.join(correct_chars)
+    orig_durs    = [dur for dur, _ in orig_chars]
+
+    sm     = difflib.SequenceMatcher(None, orig_text, correct_text, autojunk=False)
+    blocks = sm.get_matching_blocks()   # list of Match(a, b, size)
+
+    # 建立映射：correct 位置 → orig 位置
+    correct_to_orig = {}
+    orig_used       = set()
+    for blk in blocks:
+        for k in range(blk.size):
+            ci = blk.b + k
+            oi = blk.a + k
+            if 0 <= ci < len(correct_chars) and 0 <= oi < len(orig_chars):
+                correct_to_orig[ci] = oi
+                orig_used.add(oi)
+
+    # 未被命中的 orig 時間（分給新增字元用）
+    spare_dur = sum(orig_durs[oi] for oi in range(len(orig_chars)) if oi not in orig_used)
+    gaps      = [ci for ci in range(len(correct_chars)) if ci not in correct_to_orig]
+    per_gap   = (spare_dur // len(gaps)) if gaps else 0
+    extra     = spare_dur - per_gap * len(gaps) if gaps else 0
+
+    result    = [None] * len(correct_chars)
+    gap_k     = 0
+
+    # Step 1：LCS 命中字元繼承時間
+    for ci, oi in correct_to_orig.items():
+        result[ci] = (orig_durs[oi], correct_chars[ci])
+
+    # Step 2：非命中字元均分剩餘時間
+    for ci in gaps:
+        dur        = per_gap + (1 if gap_k < extra else 0)
+        result[ci] = (max(1, dur), correct_chars[ci])
+        gap_k     += 1
+
+    return result
+
+
 def fill_slots(dia: dict) -> dict:
     """
     把 lyric_match 的正確文字填回 \\k slot，時間優先保留。
 
     Case A（字數相同）: 1:1 替換，時間完全不動。
-    Case B（字數不同）: 按正確字數等分總時間，標記需複查。
+    Case B（字數不同）: LCS 對齊 — 保留公共字元的時間，剩餘時間均分給新增字元。
+                       時間分配比「等分全部」更精準，\'needs_review\' 仍標記。
     """
     d           = deepcopy(dia)
     correct_raw = d.get('lyric_match', '')
@@ -302,9 +430,10 @@ def fill_slots(dia: dict) -> dict:
     # 過濾空格 slot，只處理實際文字字元
     orig_slots = d['slots']
     nonsp_idx  = [i for i, (dur, ch) in enumerate(orig_slots) if ch and ch.strip()]
+    orig_chars = [(orig_slots[i][0], orig_slots[i][1]) for i in nonsp_idx]  # (dur, ch)
 
-    if len(nonsp_idx) == len(correct):
-        # Case A
+    if len(orig_chars) == len(correct):
+        # Case A：字數相同，1:1 替換，時間完全不動
         new_slots = list(orig_slots)
         for slot_i, new_ch in zip(nonsp_idx, correct):
             dur = new_slots[slot_i][0]
@@ -313,15 +442,11 @@ def fill_slots(dia: dict) -> dict:
         d['was_remapped'] = False
 
     else:
-        # Case B：等分總時間（含原始空格的時間）
-        total_cs = sum(dur for dur, _ in orig_slots)
-        n        = len(correct)
-        base_cs  = total_cs // n
-        rem_cs   = total_cs - base_cs * n
-        new_slots = []
-        for i, ch in enumerate(correct):
-            dur = base_cs + (1 if i < rem_cs else 0)
-            new_slots.append((dur, ch))
+        # Case B：字數不同，LCS 時間對齊
+        correct_chars = list(correct)   # list of str
+        aligned       = _lcs_align(orig_chars, correct_chars)
+        # aligned = [(dur, ch), ...]，長度 = len(correct)
+        new_slots = [(dur, ch) for dur, ch in aligned]
         d['slots']        = new_slots
         d['was_remapped'] = True
         d['needs_review'] = True
@@ -335,8 +460,9 @@ def fill_slots(dia: dict) -> dict:
 
 def rebuild_dialogue(dia: dict) -> str:
     text = slots_to_ass_text(dia['slots'], dia.get('remainder', ''))
+    if dia.get('was_garbage'):
+        return dia['prefix'] + text   # 廣告/版權行原樣輸出，不加標記
     if dia.get('needs_review'):
-        # 在前面加一行 Comment 標記，不污染 Dialogue 本身
         orig_text = slots_to_text(dia['slots'])
         comment   = (f"Comment: 0,0:00:00.00,0:00:00.00,Karaoke,,0,0,0,,"
                      f"[REVIEW] conf={dia.get('confidence',0):.2f} {orig_text}")
@@ -379,12 +505,23 @@ def correct_lyrics(
 
     write_ass(output_path, header, filled, footer)
 
-    total    = len(filled)
-    ok       = sum(1 for d in filled if not d.get('needs_review'))
+    if verbose:
+        for i, d in enumerate(filled):
+            if d.get('was_garbage'):
+                print(f'  [SKIP] 行{i:2d}: 非歌詞行保留  "{slots_to_text(d["slots"])[:25]}"')
+            elif d.get('was_remapped'):
+                n_s = len(d['slots'])
+                n_l = len(normalize(d.get('lyric_match', '')))
+                print(f'  ⚠️ 行{i:2d}: 字數 {n_s}→{n_l}  '
+                      f'(conf={d["confidence"]:.2f})  "{d.get("lyric_match", "")[:25]}"')
+
+    garbage  = sum(1 for d in filled if d.get('was_garbage'))
+    real     = len(filled) - garbage
+    ok       = sum(1 for d in filled if not d.get('needs_review') and not d.get('was_garbage'))
     review   = sum(1 for d in filled if d.get('needs_review'))
     remapped = sum(1 for d in filled if d.get('was_remapped'))
-    print(f'\n完成！共 {total} 行：✅ {ok} 行自動校正，'
-          f'⚠️  {review} 行需確認（其中 {remapped} 行字數不符重新分配）')
+    print(f'\n完成！共 {real} 行歌詞（跳過 {garbage} 非歌詞行）：'
+          f'✅ {ok} 行自動校正，⚠️  {review} 行需確認（其中 {remapped} 行字數重新分配）')
     print(f'輸出：{output_path}')
 
 
@@ -521,7 +658,7 @@ def correct_ass(ass_path, query: str, threshold: float = 0.45) -> bool:
             save_dir = ROOT_DIR / "output" / "subtitles"
             save_dir.mkdir(parents=True, exist_ok=True)
             (save_dir / "lyrics_fetched.txt").write_text("\n".join(lines), encoding="utf-8")
-            correct_lyrics(str(ass_path), str(plain_path), str(ass_path), threshold)
+            correct_lyrics(str(ass_path), str(plain_path), str(ass_path), threshold, verbose=True)
             # 驗證結果
             filled = parse_ass(str(ass_path))[1]
             ok = sum(1 for d in filled if not d.get('needs_review'))
@@ -561,17 +698,28 @@ def correct_ass(ass_path, query: str, threshold: float = 0.45) -> bool:
 
 
 def _split_lyric_lines(lines: list) -> list:
-    """把「兩句並排在同一行（空格分隔）」的歌詞拆開，與 load_lyrics 邏輯一致。"""
+    """
+    把「兩句並排在同一行（空格分隔）」的歌詞拆開。
+    與 load_lyrics 邏輯一致：只有「恰好一個分隔點，且兩側各 >=4 字」才拆。
+    """
     result = []
     for line in lines:
-        parts = re.split(
+        splits = list(re.finditer(
             r'(?<=[\u4e00-\u9fff\u3040-\u30ff])[ \u3000]+(?=[\u4e00-\u9fff\u3040-\u30ff])',
             line
-        )
-        for p in parts:
-            p = p.strip()
-            if p:
-                result.append(p)
+        ))
+        if len(splits) == 1:
+            m     = splits[0]
+            left  = re.sub(r'\s', '', line[:m.start()])
+            right = re.sub(r'\s', '', line[m.end():])
+            if len(left) >= 5 and len(right) >= 5:
+                for p in [line[:m.start()].strip(), line[m.end():].strip()]:
+                    if p: result.append(p)
+                continue
+        # 多個空格或不符合拆分條件：整行保留
+        line = line.strip()
+        if line:
+            result.append(line)
     return result
 
 
