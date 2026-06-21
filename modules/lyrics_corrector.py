@@ -14,8 +14,30 @@ lyrics_corrector.py
     1. 解析 ASS → 取出每行純文字（去除 \\k tag）
     2. 全局搜尋 + 副歌重複支援：對每個 ASS 行找最佳歌詞行
     3. 字元 slot 保留 \\k 時間，填入正確文字
-    4. 字數不符時按比例重新分配，標記 [?] 待人工確認
+    4. 字數不符時 LCS 對齊重新分配，標記 [?] 待人工確認
     5. 重寫 ASS，時間軸完全不動
+
+v2 改動重點：
+    [對齊準確率]
+    - _hybrid_score() 從 partial_ratio+token_set 二項
+      升級為 fuzz.ratio + partial_ratio + Jaccard 三項加權，
+      並在「ASS行字數 == 歌詞行字數」時給予 +0.08 bonus，
+      解決 Whisper 同音誤字嚴重時信心值虛低的問題。
+
+    [非歌詞行過濾]
+    - 新增 _is_garbage_line()：偵測版權行、平台廣告字幕、
+      簡體字幕等非歌詞行，跳過校正並原文保留。
+    - 比例錨點改為只計算非垃圾行，避免廣告行干擾位置推算。
+
+    [歌詞載入]
+    - load_lyrics()：手動歌詞原行原樣載入，不再自動拆行
+      （舊版把句內空格誤判為兩句分隔，導致行數爆炸、對齊全偏）。
+    - _split_lyric_lines()：網路歌詞仍拆行，但限制條件為
+      「恰好一個分隔點且兩側各 ≥5 字」才拆。
+
+    [時間分配]
+    - fill_slots()：字數不符時改用 LCS 對齊，公共字元繼承
+      原始 \\k 時間，只有新增字元才均分剩餘時間。
 """
 
 import re
@@ -227,19 +249,52 @@ def _is_garbage_line(text: str) -> bool:
 
 def _hybrid_score(a: str, b: str) -> float:
     """
-    混合分數 = content 相似度 × 長度懲罰
+    v2 混合信心分：三項加權 + 字數相符 bonus
 
-    content:
-      - partial_ratio（7 成）：在長字串中找短字串的最佳子視窗
-      - token_set_ratio（3 成）：不分順序比對共用字元集
-    長度懲罰： min(len1, len2) / max(len1, len2)
-    避免 2 字的 ASS 行靠子字串匹配到 20 字的歌詞行。
+    ┌─────────────────┬──────┬──────────────────────────────────────┐
+    │ 指標             │ 權重 │ 用途                                  │
+    ├─────────────────┼──────┼──────────────────────────────────────┤
+    │ fuzz.ratio      │ 0.40 │ 嚴格逐位比對，正確行得高分            │
+    │ partial_ratio   │ 0.30 │ 子字串比對，處理歌詞長短不一           │
+    │ Jaccard（字元集）│ 0.30 │ 不管順序，只看字元重疊                │
+    │                 │      │ → 同音誤字仍有共用字，能拉高分數       │
+    └─────────────────┴──────┴──────────────────────────────────────┘
+
+    長度懲罰（len_ratio）：
+        min/max 字數比，避免 2 字 ASS 行靠 partial 匹配到 20 字歌詞行。
+
+    字數相符 bonus（+0.08）：
+        Whisper 同音誤字嚴重時（如「耳觀上的」→「而關上燈」），
+        fuzz.ratio 只有 0.3~0.4，但字數通常仍正確。
+        字數相同代表 \\k slot 可 1:1 填入，是強烈的正確對應訊號，
+        給予 bonus 讓這類行能過 threshold，不被標為 [?]。
+
+    v1 舊版：partial_ratio × 0.7 + token_set_ratio × 0.3
+    v2 新版：ratio × 0.4 + partial × 0.3 + jaccard × 0.3 + 字數 bonus
     """
-    pr = fuzz.partial_ratio(a, b) / 100.0
-    ts = fuzz.token_set_ratio(a, b) / 100.0
-    content = 0.7 * pr + 0.3 * ts
+    if not a or not b:
+        return 0.0
+
+    # ── 三項相似度 ──
+    ratio   = fuzz.ratio(a, b) / 100.0           # 嚴格逐位
+    partial = fuzz.partial_ratio(a, b) / 100.0   # 子字串
+    set_a, set_b = set(a), set(b)
+    jaccard = (len(set_a & set_b) / len(set_a | set_b)
+               if set_a | set_b else 0.0)         # 字元集交集
+
+    score = 0.4 * ratio + 0.3 * partial + 0.3 * jaccard
+
+    # ── 長度懲罰：字數差距大時壓低分數 ──
     len_ratio = min(len(a), len(b)) / max(len(a), len(b))
-    return content * len_ratio
+    score *= len_ratio
+
+    # ── 字數相符 bonus ──
+    # Whisper 同音誤字嚴重但字數正確時（最常見的誤識情形），
+    # 給予 +0.08 讓對齊能過 threshold，避免被誤標為 [?]。
+    if len(a) == len(b):
+        score = min(1.0, score + 0.08)
+
+    return score
 
 
 def align_ass_to_lyrics(
