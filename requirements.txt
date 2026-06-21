@@ -2,4 +2,5 @@ yt-dlp>=2024.0.0
 faster-whisper>=1.0.0
 spleeter>=2.3.0
 numpy<2
+pypinyin
 syncedlyrics
